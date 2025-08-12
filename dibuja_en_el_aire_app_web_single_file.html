@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dibuja en el aire — Web App</title>
+  <style>
+    :root{--accent:#ff3b30}
+    html,body{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,Segoe UI,Roboto,'Helvetica Neue',Arial}
+    .app{display:grid;grid-template-columns:320px 1fr;height:100vh;gap:12px;padding:12px;background:#0f172a;color:#e6eef8}
+    .panel{background:linear-gradient(180deg,#0b1220,#071028);padding:16px;border-radius:12px;box-shadow:0 6px 18px rgba(2,6,23,.6)}
+    h1{font-size:18px;margin:0 0 12px}
+    label{display:block;font-size:13px;margin:12px 0 6px}
+    button,select,input[type=range]{width:100%;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,.06);background:transparent;color:inherit}
+    .row{display:flex;gap:8px}
+    .row > *{flex:1}
+    #videoElement{display:none}
+    .stage{position:relative;border-radius:12px;overflow:hidden;background:#000}
+    #output_canvas{position:absolute;left:0;top:0;width:100%;height:100%;touch-action:none}
+    #overlay_canvas{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}
+    .footer{font-size:12px;opacity:.85;margin-top:10px}
+    .small{font-size:12px;color:#9fb0d9}
+    .controls{display:flex;gap:8px;margin-top:10px}
+    .controls button{flex:1}
+    .badge{font-size:12px;padding:6px;border-radius:999px;background:rgba(255,255,255,.03);display:inline-block}
+  </style>
+  <!-- MediaPipe via CDN (browser-ready scripts) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+</head>
+<body>
+  <div class="app">
+    <aside class="panel">
+      <h1>Dibuja en el aire</h1>
+      <div class="small">Abre la cámara y dibuja moviendo tu dedo índice. Mantén el dedo medio abajo para dibujar, levántalo para mover sin dibujar. Compatible en Chrome/Edge/Firefox con getUserMedia.</div>
+
+      <label for="color">Color</label>
+      <input id="color" type="color" value="#ff3b30">
+
+      <label for="size">Tamaño del pincel: <span id="sizeVal">8</span> px</label>
+      <input id="size" type="range" min="1" max="60" value="8">
+
+      <label for="smoothing">Suavizado: <span id="smoothVal">0.85</span></label>
+      <input id="smoothing" type="range" min="0" max="0.99" step="0.01" value="0.85">
+
+      <label for="mode">Modo</label>
+      <select id="mode"><option value="draw">Dibujar (índice arriba, medio abajo)</option><option value="pinch">Dibujar con pellizco (índice+pulgar)</option></select>
+
+      <div class="controls">
+        <button id="startBtn">Iniciar cámara</button>
+        <button id="clearBtn">Limpiar</button>
+      </div>
+
+      <div style="margin-top:12px">
+        <div class="badge">FPS: <span id="fps">--</span></div>
+        <div style="height:8px"></div>
+        <div class="badge">Estado: <span id="status">detenido</span></div>
+      </div>
+
+      <div class="footer">Consejos: usa fondo contrastante, mantén buena iluminación. Si tu equipo va lento, reduce la resolución en el código.</div>
+    </aside>
+
+    <main class="stage panel" id="stage">
+      <video id="videoElement" autoplay playsinline></video>
+      <canvas id="output_canvas"></canvas>
+      <canvas id="overlay_canvas"></canvas>
+    </main>
+  </div>
+
+<script>
+(async function(){
+  // Elementos
+  const video = document.getElementById('videoElement');
+  const outCanvas = document.getElementById('output_canvas');
+  const overlay = document.getElementById('overlay_canvas');
+  const startBtn = document.getElementById('startBtn');
+  const clearBtn = document.getElementById('clearBtn');
+  const colorInput = document.getElementById('color');
+  const sizeInput = document.getElementById('size');
+  const sizeVal = document.getElementById('sizeVal');
+  const smoothing = document.getElementById('smoothing');
+  const smoothVal = document.getElementById('smoothVal');
+  const modeSelect = document.getElementById('mode');
+  const fpsEl = document.getElementById('fps');
+  const statusEl = document.getElementById('status');
+
+  let canvasCtx = outCanvas.getContext('2d');
+  let overlayCtx = overlay.getContext('2d');
+  let camera = null;
+  let drawing = false;
+  let lastPos = null;
+  let lastTime = performance.now();
+  let lastFPSUpdate = performance.now();
+  let frameCount = 0;
+
+  function resizeCanvases(){
+    const rect = document.getElementById('stage').getBoundingClientRect();
+    [outCanvas, overlay].forEach(c=>{c.width = rect.width; c.height = rect.height; c.style.width = rect.width+'px'; c.style.height = rect.height+'px';});
+  }
+  window.addEventListener('resize', resizeCanvases);
+  resizeCanvases();
+
+  // Control UI
+  sizeInput.addEventListener('input', ()=>{sizeVal.textContent = sizeInput.value});
+  smoothing.addEventListener('input', ()=>{smoothVal.textContent = smoothing.value});
+
+  clearBtn.addEventListener('click', ()=>{
+    canvasCtx.clearRect(0,0,outCanvas.width,outCanvas.height);
+  });
+
+  startBtn.addEventListener('click', async ()=>{
+    if(statusEl.textContent === 'detenido'){
+      await startCamera();
+      startBtn.textContent = 'Detener cámara';
+    } else {
+      stopCamera();
+      startBtn.textContent = 'Iniciar cámara';
+    }
+  });
+
+  // Mapa de coordenadas de video -> canvas
+  function videoToCanvas(x,y){
+    // MediaPipe devuelve coordenadas normalizadas (0..1) con x from left, y from top
+    return {x: x * outCanvas.width, y: y * outCanvas.height};
+  }
+
+  // Lerp smoothing
+  function lerp(a,b,t){ return a + (b-a)*t; }
+
+  // Setup MediaPipe Hands
+  const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+  hands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.6
+  });
+
+  hands.onResults(onResults);
+
+  async function startCamera(){
+    try{
+      const stream = await navigator.mediaDevices.getUserMedia({video:{width:640,height:480}, audio:false});
+      video.srcObject = stream;
+      await video.play();
+
+      // If using Camera util from MediaPipe
+      camera = new Camera(video, {
+        onFrame: async () => { await hands.send({image: video}); },
+        width: 640,
+        height: 480
+      });
+      camera.start();
+      statusEl.textContent = 'activo';
+      resizeCanvases();
+    }catch(err){
+      console.error('Error al abrir la cámara', err);
+      alert('No se pudo acceder a la cámara: ' + err.message);
+    }
+  }
+  function stopCamera(){
+    if(camera) camera.stop();
+    const tracks = video.srcObject ? video.srcObject.getTracks() : [];
+    tracks.forEach(t=>t.stop());
+    video.srcObject = null;
+    statusEl.textContent = 'detenido';
+  }
+
+  function distance(a,b){
+    const dx = a.x-b.x; const dy = a.y-b.y; return Math.hypot(dx,dy);
+  }
+
+  function onResults(results){
+    // FPS counter
+    frameCount++;
+    const now = performance.now();
+    if(now - lastFPSUpdate > 500){ fpsEl.textContent = Math.round((frameCount*1000)/(now-lastFPSUpdate)); lastFPSUpdate = now; frameCount = 0; }
+
+    overlayCtx.clearRect(0,0,overlay.width,overlay.height);
+
+    if(!results.multiHandLandmarks || results.multiHandLandmarks.length===0){
+      lastPos = null; drawing = false; return;
+    }
+
+    const landmarks = results.multiHandLandmarks[0];
+    // Draw landmarks lightly on overlay for feedback
+    drawConnectors(overlayCtx, landmarks, HAND_CONNECTIONS, {color:'#7ee1ff', lineWidth:2});
+    drawLandmarks(overlayCtx, landmarks, {color:'#ffd27e', lineWidth:1});
+
+    // Landmark indexes: 8 = index fingertip, 6 = index pip, 12 = middle fingertip, 10 = middle pip, 4 = thumb tip
+    const idxTip = landmarks[8];
+    const idxPip = landmarks[6];
+    const midTip = landmarks[12];
+    const midPip = landmarks[10];
+    const thumbTip = landmarks[4];
+
+    // Decide whether drawing based on mode
+    let shouldDraw = false;
+    if(modeSelect.value === 'draw'){
+      // index extended (tip above pip) and middle not extended => draw
+      const indexExtended = idxTip.y < idxPip.y; // smaller y means higher on screen
+      const middleExtended = midTip.y < midPip.y;
+      shouldDraw = indexExtended && !middleExtended;
+    } else if(modeSelect.value === 'pinch'){
+      // draw when distance between index tip and thumb tip is small (pellizco)
+      const d = distance(idxTip, thumbTip);
+      shouldDraw = d < 0.06; // tuned threshold (normalized coords)
+    }
+
+    // Transform to canvas coords
+    const pos = videoToCanvas(idxTip.x, idxTip.y);
+
+    // Smooth positions
+    if(!lastPos){ lastPos = pos; }
+    const t = 1 - parseFloat(smoothing.value); // smoothing slider -> lerp factor
+    const curX = lerp(lastPos.x, pos.x, t);
+    const curY = lerp(lastPos.y, pos.y, t);
+    const curPos = {x: curX, y: curY};
+
+    // Draw on main canvas if shouldDraw
+    if(shouldDraw){
+      canvasCtx.lineCap = 'round';
+      canvasCtx.lineJoin = 'round';
+      canvasCtx.strokeStyle = colorInput.value;
+      canvasCtx.lineWidth = parseFloat(sizeInput.value);
+      if(lastPos && drawing === false){
+        // start a path
+        canvasCtx.beginPath();
+        canvasCtx.moveTo(curPos.x, curPos.y);
+        drawing = true;
+      } else if(drawing){
+        canvasCtx.lineTo(curPos.x, curPos.y);
+        canvasCtx.stroke();
+      }
+    } else {
+      // stop drawing (lift pen)
+      if(drawing){
+        canvasCtx.closePath();
+      }
+      drawing = false;
+    }
+
+    // Draw a pointer circle on overlay
+    overlayCtx.beginPath(); overlayCtx.arc(curPos.x, curPos.y, Math.max(6, parseFloat(sizeInput.value)/2), 0, Math.PI*2); overlayCtx.fillStyle = '#ffffff22'; overlayCtx.fill();
+    overlayCtx.beginPath(); overlayCtx.arc(curPos.x, curPos.y, 3, 0, Math.PI*2); overlayCtx.fillStyle = '#fff'; overlayCtx.fill();
+
+    lastPos = curPos;
+  }
+
+  // Resize canvases properly after DOM paint
+  requestAnimationFrame(resizeCanvases);
+
+  // Helpful: stop camera when page unloads
+  window.addEventListener('beforeunload', stopCamera);
+
+})();
+</script>
+</body>
+</html>
